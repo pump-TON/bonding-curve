@@ -199,12 +199,14 @@ global int price_divider;
         coeff_c = in_msg_body~load_uint(4);
         price_divider = in_msg_body~load_uint(4);
         save_data();
+        return ();
     }
 
     if (op == op::lock_curve) {
         throw_unless(73, equal_slices(sender_address, admin_address));
         is_locked = 1;
         save_data();
+        return ();
     }
 
     if (op == op::mint()) {
