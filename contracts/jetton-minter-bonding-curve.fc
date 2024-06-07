@@ -1,0 +1,275 @@
+;; Jetton minter bonding-curve smart contract
+
+#include "stdlib.fc";
+#include "params.fc";
+#include "op-codes.fc";
+#include "jetton-utils.fc";
+#include "math.fc";
+
+const int curve::constant  = 1;
+const int curve::quadratic = 2;
+const int curve::sigmoid   = 3;
+
+const int op::buy  = 8888;
+const int op::set_curve = 9000;
+const int op::lock_curve = 9999;
+
+const int error::not_enough_tons = 701;
+const int error::under_bid = 702;
+
+const int fee::mint = 20000000;
+const int decimals  = 1000000000;
+
+global int total_supply;
+global slice admin_address;
+global cell metadata;
+global cell jetton_wallet_code;
+global int is_locked;
+global int curve_type;
+global int coeff_a;
+global int coeff_b;
+global int coeff_c;
+global int price_divider;
+
+() load_data() impure inline {
+    slice ds = get_data().begin_parse();
+    total_supply = ds~load_coins();   ;; 这块改一下，不要默认9位精度。读取元数据中的精度
+    admin_address = ds~load_msg_addr();
+    metadata = ds~load_ref();
+    jetton_wallet_code = ds~load_ref();
+    is_locked = ds~load_uint(1);
+    curve_type = ds~load_uint(1);
+    coeff_a = ds~load_uint(4);      ;; 恒定价格时代表汇率
+    coeff_b = ds~load_uint(4);
+    coeff_c = ds~load_uint(4);
+    price_divider = ds~load_uint(4);
+}
+
+() save_data() impure inline {
+    set_data(begin_cell()
+        .store_coins(total_supply)
+        .store_slice(admin_address)
+        .store_ref(metadata)
+        .store_ref(jetton_wallet_code)
+        .store_uint(is_locked, 1)
+        .store_uint(curve_type, 1)
+        .store_uint(coeff_a, 4)
+        .store_uint(coeff_b, 4)
+        .store_uint(coeff_c, 4)
+        .store_uint(price_divider, 4)
+        .end_cell());
+}
+
+(int) get_price_at_supply(int supply) method_id {
+    if (curve_type == curve::quadratic) {
+        return math::pow(supply, coeff_b) * coeff_a + coeff_c;
+    } elseif (curve_type == curve::sigmoid) {
+        int temp1 = supply - coeff_b;
+        int temp2 = temp1 * temp1 + coeff_c;
+        int temp3 = math::sqrt(temp2);
+        return (temp1 / temp3 + 1) * coeff_a;
+    }
+    return 0;
+}
+
+(int) get_reserve_at_supply(int supply) method_id {
+    if (curve_type == curve::quadratic) {
+        int temp1 = math::pow(supply, (coeff_b + 1));
+        int temp2 = (temp1 * coeff_a) / (coeff_b + 1);
+        int temp3 = supply * coeff_c;
+        return temp2 + temp3; 
+    } elseif (curve_type == curve::sigmoid) {
+        int temp1 = supply - coeff_b;
+        int temp2 = temp1 * temp1 + coeff_c;
+        int temp3 = math::sqrt(temp2);
+        int temp4 = (temp3 + supply) * coeff_a;
+        int temp5 = math::sqrt(coeff_b * coeff_b + coeff_c);
+        return temp4 - (coeff_a * temp5);
+    }
+    return 0;
+}
+
+(int) get_current_price() method_id {
+    load_data();
+    return get_price_at_supply(total_supply / decimals);
+}
+
+(int) get_total_price_to_mint(int amount) method_id {
+    load_data();
+    int supply = total_supply / decimals;
+    int current_reserve = get_reserve_at_supply(supply);
+    int reserve_after_mint = get_reserve_at_supply(supply + amount);
+    return (reserve_after_mint - current_reserve);
+}
+
+(int) get_returns_for_burn(int amount) method_id {
+    load_data();
+    int supply = total_supply / decimals;
+    int current_reserve = get_reserve_at_supply(supply);
+    int reserve_after_burn = get_reserve_at_supply(supply - amount);
+    return (current_reserve - reserve_after_burn);
+}
+
+() mint_tokens(slice to_address, int amount, cell master_msg) impure {
+    cell state_init = calculate_jetton_wallet_state_init(to_address, my_address(), jetton_wallet_code);
+    slice to_wallet_address = calculate_jetton_wallet_address(state_init);
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(to_wallet_address)
+        .store_coins(amount)
+        .store_uint(7, 108)
+        .store_ref(state_init)
+        .store_ref(master_msg);
+    send_raw_message(msg.end_cell(), 1); ;; pay transfer fees separately, revert on errors
+}
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {  ;; ignore all bounced messages
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+    if (op == op::buy) {
+        if (~ is_locked) {
+            return ();
+        }
+        slice to_address = in_msg_body~load_msg_addr();
+        int bid_ton = in_msg_body~load_coins();
+        int transfer_to_wallet_ton = in_msg_body~load_coins();
+        throw_unless(error::not_enough_tons, msg_value >= bid_ton + transfer_to_wallet_ton + fee::mint);
+
+        cell mint_cell = in_msg_body~load_ref();
+        slice mint_cs = mint_cell.begin_parse();
+        mint_cs~skip_bits(32 + 64);
+        int jetton_amount = mint_cs~load_coins();
+        int total_price = get_total_price_to_mint(jetton_amount / decimals) * decimals / price_divider;
+        throw_unless(error::under_bid, bid_ton >= total_price);
+
+        mint_tokens(to_address, transfer_to_wallet_ton, mint_cell);
+        total_supply += jetton_amount;
+        save_data();
+        return ();
+    }
+
+    if (op == op::burn_notification()) {
+        int jetton_amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        throw_unless(74,
+            equal_slices(calculate_user_jetton_wallet_address(from_address, my_address(), jetton_wallet_code), sender_address)
+        );
+        total_supply -= jetton_amount;
+        save_data();
+
+        int return_tons = get_returns_for_burn(jetton_amount / decimals) * decimals / price_divider;
+        var msg = begin_cell()
+            .store_uint(0x10, 6)
+            .store_slice(from_address)
+            .store_coins(return_tons)
+            .store_uint(0, 107);
+        send_raw_message(msg.end_cell(), 2 + 64);
+   
+        slice response_address = in_msg_body~load_msg_addr();
+        if (response_address.preload_uint(2) != 0) {
+            var msg = begin_cell()
+                .store_uint(0x10, 6)  ;; no bounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 011000
+                .store_slice(response_address)
+                .store_coins(0)
+                .store_uint(0, 107)
+                .store_uint(op::excesses(), 32)
+                .store_uint(query_id, 64);
+            send_raw_message(msg.end_cell(), 2 + 64);
+        }
+        return ();
+    }
+
+    if (op == op::set_curve) {
+        throw_unless(73, equal_slices(sender_address, admin_address));
+        curve_type = in_msg_body~load_uint(1);
+        coeff_a = in_msg_body~load_uint(4);
+        coeff_b = in_msg_body~load_uint(4);
+        coeff_c = in_msg_body~load_uint(4);
+        price_divider = in_msg_body~load_uint(4);
+        save_data();
+    }
+
+    if (op == op::lock_curve) {
+        throw_unless(73, equal_slices(sender_address, admin_address));
+        is_locked = 1;
+        save_data();
+    }
+
+    if (op == op::mint()) {
+        throw_unless(73, equal_slices(sender_address, admin_address));
+        slice to_address = in_msg_body~load_msg_addr();
+        int amount = in_msg_body~load_coins();
+        cell master_msg = in_msg_body~load_ref();
+        slice master_msg_cs = master_msg.begin_parse();
+        master_msg_cs~skip_bits(32 + 64); ;; op + query_id
+        int jetton_amount = master_msg_cs~load_coins();
+
+        mint_tokens(to_address, amount, master_msg);
+        total_supply += jetton_amount;
+        save_data();
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+(int, int, slice, cell, cell) get_jetton_data() method_id {
+    load_data();
+    return (total_supply, -1, admin_address, metadata, jetton_wallet_code); 
+}
+
+slice get_wallet_address(slice owner_address) method_id {
+    load_data();
+    return calculate_user_jetton_wallet_address(owner_address, my_address(), jetton_wallet_code);
+}
+
+(int, int, int, int, int, int) get_curve_data() method_id {
+    load_data();
+    return (is_locked, curve_type, coeff_a, coeff_b, coeff_c, price_divider);
+}
+
+
+{-
+(int) get_total_price_per_token(int amount) method_id {
+    int n = 0;
+    int total_price = 0;
+    while (n < amount) {
+        n += 1;
+        total_price += get_price_at_supply(n);  
+    }
+    return total_price;
+}
+-}
+
+{-
+      int amount = 10000000;
+      int buy_amount = msg_value; ;; for mint message
+      throw_unless(76, buy_amount > 0);
+      int jetton_amount = buy_amount * exchange_rate;    ;; rate 1 jetton = 1 toncoin; multiply to price here
+
+      var master_msg = begin_cell()
+          .store_uint(op::internal_transfer(), 32)
+          .store_uint(0, 64) ;; query_id
+          .store_coins(jetton_amount)
+          .store_slice(my_address()) ;; from_address
+          .store_slice(sender_address) ;; response_address
+          .store_coins(0) ;; no forward_amount
+          .store_uint(0, 1) ;; forward_payload in this slice, not separate cell
+          .end_cell();
+      mint_tokens(sender_address, amount, master_msg);
+
+      total_supply += jetton_amount;
+      save_data();
+-}
